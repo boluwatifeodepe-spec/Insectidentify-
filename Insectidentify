@@ -1,0 +1,175 @@
+// 🪲 Insect Identify (Camera + PWA Version)
+// One file: backend + frontend + AI + offline install
+const express = require("express");
+const multer = require("multer");
+const sqlite3 = require("sqlite3").verbose();
+const path = require("path");
+const fs = require("fs");
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+
+// ---- Database ----
+const db = new sqlite3.Database(path.join(__dirname, "data.sqlite"));
+db.run(`
+  CREATE TABLE IF NOT EXISTS favorites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT,
+    labels TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+// ---- File upload ----
+const storage = multer.diskStorage({
+  destination: (_, __, cb) => cb(null, UPLOAD_DIR),
+  filename: (_, file, cb) =>
+    cb(null, Date.now() + "-" + Math.round(Math.random() * 1e9) + path.extname(file.originalname))
+});
+const upload = multer({ storage });
+
+app.use("/uploads", express.static(UPLOAD_DIR));
+app.use(express.json());
+
+// ---- API routes ----
+app.post("/api/favorites", upload.single("image"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No image" });
+  db.run(`INSERT INTO favorites (filename, labels) VALUES (?, ?)`,
+    [req.file.filename, req.body.labels],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ id: this.lastID });
+    });
+});
+
+app.get("/api/favorites", (_, res) => {
+  db.all(`SELECT * FROM favorites ORDER BY created_at DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows.map(r => ({ ...r, url: "/uploads/" + r.filename })));
+  });
+});
+
+// ---- Manifest (for installability) ----
+app.get("/manifest.json", (_, res) => {
+  res.json({
+    name: "Insect Identify",
+    short_name: "Insects",
+    start_url: ".",
+    display: "standalone",
+    background_color: "#f5f7fb",
+    theme_color: "#2563eb",
+    icons: [
+      {
+        src: "https://cdn-icons-png.flaticon.com/512/616/616408.png",
+        sizes: "512x512",
+        type: "image/png"
+      }
+    ]
+  });
+});
+
+// ---- Service Worker ----
+app.get("/sw.js", (_, res) => {
+  res.type("text/javascript").send(`
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open('insect-cache-v1').then(c => c.addAll(['/', '/manifest.json'])));
+});
+self.addEventListener('fetch', e => {
+  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+});
+`);
+});
+
+// ---- Frontend HTML ----
+app.get("/", (_, res) => res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Insect Identify</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#2563eb">
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet"></script>
+<style>
+body { font-family: Arial; background:#f5f7fb; text-align:center; margin:0; }
+header { background:#2563eb; color:white; padding:1em; font-size:1.5em; }
+.container { background:white; margin:2em auto; padding:1em; max-width:600px; border-radius:10px; box-shadow:0 0 10px rgba(0,0,0,0.1); }
+button { padding:10px 20px; background:#2563eb; color:white; border:none; border-radius:5px; cursor:pointer; margin:5px; }
+#preview { width:100%; max-height:300px; object-fit:contain; margin:1em 0; border-radius:8px; }
+.pred { margin:0.3em; }
+.favorite { border:1px solid #ddd; border-radius:8px; margin:0.5em; padding:0.5em; }
+</style>
+</head>
+<body>
+<header>🪲 Insect Identify</header>
+<div class="container">
+  <h3>Upload or take a photo</h3>
+  <input type="file" id="fileInput" accept="image/*" capture="environment"><br>
+  <img id="preview"><br>
+  <div id="predictions"></div>
+  <button id="saveBtn" disabled>Save to Favorites</button>
+  <hr>
+  <h3>Favorites</h3>
+  <div id="favorites"></div>
+</div>
+
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then(() => console.log('Service Worker registered'));
+}
+
+let model, predictions = [], currentFile;
+async function start() {
+  document.getElementById("predictions").innerHTML = "Loading AI model...";
+  model = await mobilenet.load();
+  document.getElementById("predictions").innerHTML = "Model ready. Take or choose a photo!";
+}
+start();
+
+document.getElementById("fileInput").onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  currentFile = file;
+  const imgURL = URL.createObjectURL(file);
+  document.getElementById("preview").src = imgURL;
+  document.getElementById("predictions").innerHTML = "Analyzing...";
+  const img = new Image();
+  img.src = imgURL;
+  img.onload = async () => {
+    predictions = await model.classify(img);
+    document.getElementById("predictions").innerHTML = predictions.map(p =>
+      '<div class="pred">' + p.className + ' — <b>' + (p.probability*100).toFixed(1) + '%</b></div>'
+    ).join('');
+    document.getElementById("saveBtn").disabled = false;
+  };
+};
+
+document.getElementById("saveBtn").onclick = async () => {
+  const fd = new FormData();
+  fd.append("image", currentFile);
+  fd.append("labels", JSON.stringify(predictions));
+  await fetch("/api/favorites", { method:"POST", body:fd });
+  loadFavs();
+};
+
+async function loadFavs() {
+  const res = await fetch("/api/favorites");
+  const favs = await res.json();
+  document.getElementById("favorites").innerHTML = favs.map(f =>
+    '<div class="favorite"><img src="' + f.url + '" width="100"><br>' +
+    JSON.parse(f.labels)[0].className + '<br>' + f.created_at + '</div>'
+  ).join('');
+}
+loadFavs();
+</script>
+</body>
+</html>
+`));
+
+app.listen(PORT, () =>
+  console.log(`✅ Insect Identify Camera+PWA running on http://localhost:${PORT}`)
+);
